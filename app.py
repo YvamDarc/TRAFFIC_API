@@ -1,422 +1,222 @@
 import math
-from datetime import date
+import sys
+from dataclasses import dataclass
 
-import numpy as np
 import pandas as pd
-import requests
-import streamlit as st
 
-import folium
-from streamlit_folium import st_folium
 
-# =====================================================
-# 0. Config générale
-# =====================================================
+# ================================
+# 1. PARAMÈTRES À ADAPTER
+# ================================
 
-st.set_page_config(
-    page_title="Trafic routier (TMJA) & Sentinel-2",
-    layout="wide",
+# URL ou chemin local du CSV de comptage journalier
+# Exemple : un fichier open data "comptage_journalier.csv"
+DATA_URL = "comptage_journalier.csv"  # mets ici l'URL http(s) OU un chemin local
+
+# Coordonnées de la zone d'intérêt (ex : ton commerce / centre-ville)
+TARGET_LAT = 48.50023   # exemple : près de Saint-Brieuc
+TARGET_LON = -2.72461
+
+# Rayon en km autour de la zone pour sélectionner les stations SIR
+RAYON_KM = 15.0
+
+# Nom du fichier de sortie
+OUTPUT_CSV = "indice_activite_journalier.csv"
+
+
+# ================================
+# 2. PARAMS DE MAPPING DE COLONNES
+# (À ADAPTER SUR TON FICHIER)
+# ================================
+
+@dataclass
+class ColumnMapping:
+    station_id: str
+    date: str
+    count: str
+    lat: str
+    lon: str
+
+
+# Exemple generique:
+# - 'id_station' : identifiant de la station
+# - 'date' : date (format YYYY-MM-DD)
+# - 'tmj' : trafic moyen journalier ou comptage du jour
+# - 'lat' / 'lon' : coordonnées de la station
+COLUMN_MAPPING = ColumnMapping(
+    station_id="id_station",
+    date="date",
+    count="tmj",
+    lat="lat",
+    lon="lon",
 )
 
-# ------------------------------
-# Constantes "sans URL à saisir"
-# ------------------------------
 
-# 1) TMJA national – CSV data.gouv.fr
-# Ressource officielle "Trafic moyen journalier annuel sur le réseau routier national"
-# On utilise directement l'URL de ressource (format /datasets/r/<resource_uuid>).
-TMJA_CSV_URL = (
-    "https://www.data.gouv.fr/fr/datasets/r/"
-    "d5d894b4-b58d-440c-821b-c574e9d6b175"
-)
+# ================================
+# 3. FONCTIONS UTILITAIRES
+# ================================
 
-# 2) Sentinel-2 cloudless (EOX)
-# WMS global, quasi sans nuages, usage libre non commercial avec attribution.
-SENTINEL_WMS_URL = "https://tiles.maps.eox.at/wms?"
-SENTINEL_LAYER = "s2cloudless-2023"  # couche globale en EPSG:4326
-
-
-# =====================================================
-# 1. Fonctions utilitaires
-# =====================================================
-
-@st.cache_data(show_spinner=True)
-def load_tmja() -> pd.DataFrame:
+def haversine_km(lat1, lon1, lat2, lon2):
     """
-    Charge les données TMJA depuis le CSV national (data.gouv.fr).
-
-    On essaie ; puis , comme séparateur, et on normalise les colonnes :
-    - anneeMesureTrafic
-    - TMJA
-    - RatioPL (si présente)
-    - route
-    - depPr
+    Distance entre deux points en km (formule de Haversine).
     """
-    last_error = None
+    R = 6371.0  # Rayon moyen de la Terre en km
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    d_phi = math.radians(lat2 - lat1)
+    d_lambda = math.radians(lon2 - lon1)
 
-    for sep in [";", ","]:
-        try:
-            df = pd.read_csv(TMJA_CSV_URL, sep=sep, low_memory=False)
-        except Exception as e:
-            last_error = e
-            continue
-
-        # ---- Année de mesure
-        annee_col = None
-        for col in df.columns:
-            if col.lower() in ["anneemesuretrafic", "annee", "annee_mesure_trafic"]:
-                annee_col = col
-                break
-        if annee_col is None:
-            last_error = f"Aucune colonne année trouvée dans {list(df.columns)}"
-            continue
-
-        df["anneeMesureTrafic"] = pd.to_numeric(df[annee_col], errors="coerce")
-
-        # ---- TMJA
-        tmja_col = None
-        for col in df.columns:
-            if col.lower() == "tmja":
-                tmja_col = col
-                break
-        if tmja_col is None:
-            last_error = f"Aucune colonne TMJA trouvée dans {list(df.columns)}"
-            continue
-
-        df["TMJA"] = pd.to_numeric(df[tmja_col], errors="coerce")
-
-        # ---- Ratio PL (optionnel)
-        ratio_col = None
-        for col in df.columns:
-            if col.lower() in ["ratiopl", "ratio_pl"]:
-                ratio_col = col
-                break
-        if ratio_col is not None:
-            df["RatioPL"] = pd.to_numeric(df[ratio_col], errors="coerce")
-
-        df = df.dropna(subset=["anneeMesureTrafic", "TMJA"])
-        df["anneeMesureTrafic"] = df["anneeMesureTrafic"].astype(int)
-
-        # ---- Route / département
-        for col in df.columns:
-            cl = col.lower()
-            if cl == "route":
-                df["route"] = df[col].astype(str)
-            if cl in ["deppr", "departement", "dep"]:
-                df["depPr"] = df[col].astype(str)
-
-        return df
-
-    st.error(f"Impossible de lire le CSV TMJA depuis data.gouv.fr : {last_error}")
-    return pd.DataFrame()
+    a = math.sin(d_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
 
 
-def build_tmja_history(df_tmja: pd.DataFrame, text_filter: str | None = None):
+def load_data(path_or_url: str) -> pd.DataFrame:
     """
-    Applique un filtre texte (route, département, libellés) puis
-    calcule l'historique TMJA moyen par année.
+    Charge le CSV via pandas. Si c'est une URL, il la télécharge.
     """
-    df = df_tmja.copy()
-
-    if text_filter:
-        text_filter = text_filter.strip()
-        if text_filter:
-            mask = False
-            # Route
-            if "route" in df.columns:
-                mask |= df["route"].astype(str).str.contains(text_filter, case=False, na=False)
-            # Département
-            if "depPr" in df.columns:
-                mask |= df["depPr"].astype(str).str.contains(text_filter, case=False, na=False)
-            # Libellés éventuels
-            for col in df.columns:
-                cl = col.lower()
-                if cl.startswith("nom") or cl.startswith("lib") or "section" in cl:
-                    mask |= df[col].astype(str).str.contains(text_filter, case=False, na=False)
-
-            df = df[mask]
-
-    if df.empty:
-        return df, pd.DataFrame()
-
-    df_hist = (
-        df.groupby("anneeMesureTrafic", as_index=False)["TMJA"]
-        .mean()
-        .rename(columns={"TMJA": "TMJA_moyen"})
-        .sort_values("anneeMesureTrafic")
-    )
-
-    return df, df_hist
-
-
-def bbox_from_point(lat: float, lon: float, km: float = 5.0):
-    """
-    BBOX simple autour d'un point (lat, lon) pour une fenêtre WMS.
-    """
-    dlat = km / 111.0
-    dlon = km / (111.0 * math.cos(math.radians(lat)))
-    return (lat - dlat, lon - dlon, lat + dlat, lon + dlon)
-
-
-def build_wms_getmap_url(
-    base_url: str,
-    layer: str,
-    lat: float,
-    lon: float,
-    km: float,
-    width: int = 512,
-    height: int = 512,
-):
-    """
-    Construit une URL WMS GetMap pour Sentinel-2 cloudless (EPSG:4326).
-    Pas de paramètre TIME ici : c'est une mosaïque "année 2023".
-    """
-    min_lat, min_lon, max_lat, max_lon = bbox_from_point(lat, lon, km=km)
-
-    params = {
-        "SERVICE": "WMS",
-        "REQUEST": "GetMap",
-        "VERSION": "1.3.0",
-        "LAYERS": layer,
-        "CRS": "EPSG:4326",
-        "BBOX": f"{min_lat},{min_lon},{max_lat},{max_lon}",
-        "WIDTH": str(width),
-        "HEIGHT": str(height),
-        "FORMAT": "image/png",
-    }
-
-    if "?" in base_url:
-        url = base_url.split("?")[0]
-    else:
-        url = base_url
-
-    query = "&".join(f"{k}={v}" for k, v in params.items())
-    return f"{url}?{query}"
-
-
-# =====================================================
-# 2. Interface utilisateur
-# =====================================================
-
-st.title("🚗 Trafic routier (TMJA) & 🛰 Sentinel-2 cloudless")
-
-st.write(
-    """
-Cette application affiche :
-
-- le **trafic routier** à partir des données TMJA nationales (Open Data),  
-- une **vue satellite Sentinel-2 cloudless 2023** autour d’un point que tu cliques sur la carte.
-
-Tu n’as **rien à saisir** : les sources sont déjà configurées dans le code.
-"""
-)
-
-# -----------------------------------------------------
-# 2.1 Carte cliquable pour le contexte
-# -----------------------------------------------------
-
-st.subheader("🗺️ Sélection de la zone (clic sur la carte)")
-
-center_france = [47.0, 2.0]
-m = folium.Map(location=center_france, zoom_start=6)
-
-# Session state pour le point choisi
-if "picked_lat" not in st.session_state:
-    st.session_state["picked_lat"] = None
-if "picked_lon" not in st.session_state:
-    st.session_state["picked_lon"] = None
-
-if st.session_state["picked_lat"] is not None and st.session_state["picked_lon"] is not None:
-    folium.Marker(
-        [st.session_state["picked_lat"], st.session_state["picked_lon"]],
-        tooltip="Point sélectionné",
-        icon=folium.Icon(color="red"),
-    ).add_to(m)
-
-map_data = st_folium(m, height=450, width=900, key="map_france")
-
-if map_data and map_data.get("last_clicked"):
-    st.session_state["picked_lat"] = map_data["last_clicked"]["lat"]
-    st.session_state["picked_lon"] = map_data["last_clicked"]["lng"]
-
-if st.session_state["picked_lat"] is not None:
-    st.info(
-        f"Point sélectionné : lat = {st.session_state['picked_lat']:.5f}, "
-        f"lon = {st.session_state['picked_lon']:.5f}"
-    )
-else:
-    st.info("Clique sur la carte pour positionner ta zone d’intérêt.")
-
-# =====================================================
-# 3. Trafic routier – TMJA
-# =====================================================
-
-st.subheader("📊 Trafic routier – TMJA (Open Data national)")
-
-with st.spinner("Chargement des données TMJA nationales..."):
-    df_tmja = load_tmja()
-
-if df_tmja.empty:
-    st.warning("Aucune donnée TMJA chargée. Le CSV data.gouv est peut-être temporairement indisponible.")
-else:
-    # Info sur la plage d'années réelle
-    years_available = sorted(df_tmja["anneeMesureTrafic"].dropna().unique())
-    year_min, year_max = int(min(years_available)), int(max(years_available))
-
-    st.caption(
-        f"Données TMJA nationales (Open Data). Années disponibles dans le fichier actuel : {year_min} → {year_max}."
-    )
-
-    with st.expander("🔍 Filtres sur le trafic (route, département, etc.)", expanded=True):
-        filter_text = st.text_input(
-            "Filtre texte (route, département, libellé de section, etc.)",
-            placeholder="ex : A84, N12, 22, Ille-et-Vilaine...",
-        )
-
-        # 🛠 Cas particulier : une seule année dispo → pas de slider "plage"
-        if year_min == year_max:
-            st.info(f"Une seule année de mesure est disponible : {year_min}.")
-            year_range = (year_min, year_max)
-        else:
-            year_range = st.slider(
-                "Plage d'années à considérer pour l'historique",
-                min_value=year_min,
-                max_value=year_max,
-                value=(max(year_min, year_max - 10), year_max),
-                step=1,
-            )
-
-        df_filtered, df_hist = build_tmja_history(df_tmja, filter_text)
-
-        # Filtre des années sur les data
-        df_filtered = df_filtered[
-            (df_filtered["anneeMesureTrafic"] >= year_range[0])
-            & (df_filtered["anneeMesureTrafic"] <= year_range[1])
-        ]
-        if not df_hist.empty:
-            df_hist = df_hist[
-                (df_hist["anneeMesureTrafic"] >= year_range[0])
-                & (df_hist["anneeMesureTrafic"] <= year_range[1])
-            ]
-
-
-        df_filtered = df_filtered[
-            (df_filtered["anneeMesureTrafic"] >= year_range[0])
-            & (df_filtered["anneeMesureTrafic"] <= year_range[1])
-        ]
-        if not df_hist.empty:
-            df_hist = df_hist[
-                (df_hist["anneeMesureTrafic"] >= year_range[0])
-                & (df_hist["anneeMesureTrafic"] <= year_range[1])
-            ]
-
-    col_left, col_right = st.columns([2, 3])
-
-    with col_left:
-        st.markdown("### 🧾 Aperçu des sections filtrées")
-
-        if df_filtered.empty:
-            st.warning("Aucune section ne correspond à ce filtre et à cette plage d'années.")
-        else:
-            possible_cols = ["anneeMesureTrafic", "route", "depPr", "TMJA", "RatioPL"]
-            cols_show = [c for c in possible_cols if c in df_filtered.columns]
-            if not cols_show:
-                cols_show = df_filtered.columns[:8].tolist()
-
-            st.dataframe(df_filtered[cols_show].head(500))
-
-            tmja_vals = df_filtered["TMJA"].dropna()
-            if not tmja_vals.empty:
-                st.markdown("### 📌 Statistiques TMJA sur la sélection")
-                s_col1, s_col2, s_col3 = st.columns(3)
-                s_col1.metric("TMJA moyen", f"{tmja_vals.mean():,.0f}")
-                s_col2.metric("TMJA médian", f"{tmja_vals.median():,.0f}")
-                s_col3.metric("TMJA max", f"{tmja_vals.max():,.0f}")
-            else:
-                st.info("Pas de valeurs TMJA exploitables sur cette sélection.")
-
-    with col_right:
-        st.markdown("### 📈 Historique TMJA moyen (zones filtrées)")
-
-        if df_hist.empty:
-            st.info("Aucune série historique disponible pour ces filtres.")
-        else:
-            df_hist_plot = df_hist.set_index("anneeMesureTrafic")
-            st.line_chart(df_hist_plot["TMJA_moyen"])
-            st.write(df_hist)
-
-            st.markdown("#### ℹ️ Interprétation")
-            st.markdown(
-                """
-                - Chaque point = **TMJA moyen** sur toutes les sections retenues pour l'année.  
-                - C'est une **moyenne spatiale** (sur ta sélection), pas un comptage unique.  
-                - TMJA = nombre moyen de véhicules/jour sur l'année (tous sens confondus).
-                """
-            )
-
-            csv_tmja = df_hist.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "💾 Télécharger l'historique TMJA (CSV)",
-                data=csv_tmja,
-                file_name="tmja_historique_filtre.csv",
-                mime="text/csv",
-            )
-
-# =====================================================
-# 4. Sentinel-2 cloudless en parallèle
-# =====================================================
-
-st.subheader("🛰 Vue Sentinel-2 cloudless 2023 (EOX)")
-
-st.markdown(
-    """
-On affiche ici la mosaïque mondiale **Sentinel-2 cloudless 2023** fournie par EOX :
-
-> *\"Sentinel-2 cloudless – https://s2maps.eu by EOX IT Services GmbH  
-> (Contains modified Copernicus Sentinel data 2023)\"* :contentReference[oaicite:4]{index=4}
-
-Elle est **quasi sans nuages** et couvre toute la planète.
-"""
-)
-
-if not SENTINEL_WMS_URL or not SENTINEL_LAYER:
-    st.info("Configuration WMS Sentinel-2 incomplète dans le code.")
-else:
-    # Centre = point cliqué si dispo, sinon centre France
-    if st.session_state["picked_lat"] is not None:
-        s_lat = st.session_state["picked_lat"]
-        s_lon = st.session_state["picked_lon"]
-    else:
-        s_lat, s_lon = center_france
-
-    sentinel_radius_km = st.slider(
-        "Rayon de la fenêtre Sentinel-2 autour du point (km)",
-        min_value=1,
-        max_value=50,
-        value=10,
-        step=1,
-    )
-
-    wms_url = build_wms_getmap_url(
-        base_url=SENTINEL_WMS_URL,
-        layer=SENTINEL_LAYER,
-        lat=s_lat,
-        lon=s_lon,
-        km=sentinel_radius_km,
-    )
-
-    st.markdown("### 🛰 Aperçu Sentinel-2 cloudless")
-
+    print(f"📥 Chargement des données depuis {path_or_url} ...")
     try:
-        resp_img = requests.get(wms_url, timeout=30)
-        resp_img.raise_for_status()
-        st.image(
-            resp_img.content,
-            caption=f"Sentinel-2 cloudless 2023 autour de lat={s_lat:.4f}, lon={s_lon:.4f}",
-        )
-        with st.expander("URL WMS GetMap utilisée"):
-            st.code(wms_url, language="text")
+        df = pd.read_csv(path_or_url, low_memory=False)
     except Exception as e:
-        st.error(f"Impossible de récupérer l'image WMS : {e}")
-        with st.expander("URL WMS générée (pour debug)"):
-            st.code(wms_url, language="text")
+        print(f"❌ Erreur de lecture du CSV : {e}")
+        sys.exit(1)
+
+    print(f"✅ Fichier chargé : {len(df):,} lignes, {len(df.columns)} colonnes")
+    print("   Colonnes disponibles :", list(df.columns))
+    return df
+
+
+def normalize_columns(df: pd.DataFrame, mapping: ColumnMapping) -> pd.DataFrame:
+    """
+    Renomme et convertit les colonnes importantes : station, date, comptage, lat, lon.
+    Adapte la logique ici en fonction de la structure réelle de ton fichier.
+    """
+    # On vérifie la présence des colonnes
+    for attr_name, col_name in mapping.__dict__.items():
+        if col_name not in df.columns:
+            print(f"⚠️ Colonne '{col_name}' non trouvée dans le CSV (attendu pour '{attr_name}').")
+            print("   Adapte COLUMN_MAPPING à la structure réelle de ton fichier.")
+            sys.exit(1)
+
+    df_norm = df.copy()
+
+    # Renommage standardisé
+    df_norm = df_norm.rename(
+        columns={
+            mapping.station_id: "station_id",
+            mapping.date: "date",
+            mapping.count: "count",
+            mapping.lat: "lat",
+            mapping.lon: "lon",
+        }
+    )
+
+    # Conversion types
+    df_norm["date"] = pd.to_datetime(df_norm["date"], errors="coerce")
+    df_norm["count"] = pd.to_numeric(df_norm["count"], errors="coerce")
+    df_norm["lat"] = pd.to_numeric(df_norm["lat"], errors="coerce")
+    df_norm["lon"] = pd.to_numeric(df_norm["lon"], errors="coerce")
+
+    df_norm = df_norm.dropna(subset=["date", "count", "lat", "lon", "station_id"])
+    print(f"✅ Après normalisation : {len(df_norm):,} lignes")
+    return df_norm
+
+
+def select_stations_near_point(df: pd.DataFrame, lat: float, lon: float, rayon_km: float):
+    """
+    Ajoute une colonne distance_km et garde les stations dans le rayon.
+    """
+    print(f"📍 Calcul des distances par rapport au point ({lat:.5f}, {lon:.5f}) ...")
+    df = df.copy()
+
+    # On calcule la distance pour chaque station unique
+    stations = (
+        df[["station_id", "lat", "lon"]]
+        .drop_duplicates(subset=["station_id"])
+        .reset_index(drop=True)
+    )
+
+    stations["distance_km"] = stations.apply(
+        lambda row: haversine_km(lat, lon, row["lat"], row["lon"]),
+        axis=1,
+    )
+
+    stations_sel = stations[stations["distance_km"] <= rayon_km].copy()
+
+    print(f"✅ Stations dans un rayon de {rayon_km} km : {len(stations_sel)} trouvées")
+    if stations_sel.empty:
+        print("❌ Aucune station dans le rayon choisi. Essaie d'augmenter RAYON_KM.")
+        sys.exit(0)
+
+    # Jointure pour ne garder que les mesures de ces stations
+    df_sel = df.merge(stations_sel[["station_id", "distance_km"]], on="station_id", how="inner")
+
+    print(f"✅ Lignes conservées après filtrage par distance : {len(df_sel):,}")
+    return df_sel, stations_sel
+
+
+def build_daily_index(df_sel: pd.DataFrame) -> pd.DataFrame:
+    """
+    Agrège les comptages journaliers pour construire un indice d'activité.
+    - Somme journalière sur toutes les stations
+    - Normalisation optionnelle
+    """
+    print("📊 Construction de l'indice journalier d'activité routière ...")
+
+    daily = (
+        df_sel.groupby("date", as_index=False)["count"]
+        .sum()
+        .rename(columns={"count": "count_total"})
+        .sort_values("date")
+    )
+
+    # On peut créer un indice normalisé base 100 sur la première date
+    if not daily.empty:
+        base_value = daily["count_total"].iloc[0]
+        if base_value > 0:
+            daily["indice_base100"] = (daily["count_total"] / base_value) * 100.0
+        else:
+            daily["indice_base100"] = None
+
+    print(f"✅ Série journalière créée : {len(daily):,} jours")
+    return daily
+
+
+# ================================
+# 4. MAIN
+# ================================
+
+def main():
+    print("=== Indice d'activité routière journalier (script séparé) ===")
+
+    df_raw = load_data(DATA_URL)
+    df_norm = normalize_columns(df_raw, COLUMN_MAPPING)
+
+    df_sel, stations_sel = select_stations_near_point(
+        df_norm,
+        lat=TARGET_LAT,
+        lon=TARGET_LON,
+        rayon_km=RAYON_KM,
+    )
+
+    print("\n📍 Stations utilisées :")
+    print(stations_sel[["station_id", "lat", "lon", "distance_km"]].head(20))
+
+    daily_index = build_daily_index(df_sel)
+
+    if daily_index.empty:
+        print("❌ Aucune donnée journalière après agrégation.")
+        sys.exit(0)
+
+    print("\n📈 Aperçu de la série journalière :")
+    print(daily_index.head(15))
+
+    print(f"\n💾 Export du fichier journalier vers : {OUTPUT_CSV}")
+    daily_index.to_csv(OUTPUT_CSV, index=False, encoding="utf-8")
+
+    print("\n✅ Terminé. Tu peux maintenant corréler 'indice_base100' ou 'count_total'")
+    print("   avec ton CAHT journalier en rejoignant sur la colonne 'date'.")
+
+
+if __name__ == "__main__":
+    main()
