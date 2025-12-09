@@ -157,4 +157,155 @@ bzh_cities = pd.DataFrame(
         {"ville": "Quimper", "lat": 47.9959, "lon": -4.1023},
         {"ville": "Lorient", "lat": 47.7486, "lon": -3.3664},
         {"ville": "Vannes", "lat": 47.6582, "lon": -2.7608},
-        {"ville": "Saint-Brieuc", "lat": 48
+        {"ville": "Saint-Brieuc", "lat": 48.5140, "lon": -2.7630},
+    ]
+)
+st.map(bzh_cities.rename(columns={"lon": "longitude", "lat": "latitude"}), zoom=7)
+
+
+# ---- Paramètres de la zone ----
+st.sidebar.header("🗺️ Paramètres de la zone")
+
+mode = st.sidebar.radio(
+    "Mode de saisie de la zone",
+    ["Adresse", "Latitude / Longitude"],
+    index=0
+)
+
+# Sélecteur rapide de ville bretonne
+bzh_choice = st.sidebar.selectbox(
+    "Raccourci villes bretonnes",
+    ["(aucune)", "Rennes", "Brest", "Quimper", "Lorient", "Vannes", "Saint-Brieuc"]
+)
+
+if mode == "Adresse":
+    if bzh_choice != "(aucune)":
+        default_address = f"{bzh_choice}, Bretagne, France"
+    else:
+        default_address = "Rennes, France"
+
+    address = st.sidebar.text_input("Adresse / ville / lieu", default_address)
+    lat = lon = None
+else:
+    lat = st.sidebar.number_input("Latitude", value=48.1173, format="%.6f")
+    lon = st.sidebar.number_input("Longitude", value=-1.6778, format="%.6f")
+    address = None
+
+radius_m = st.sidebar.slider("Rayon de recherche (mètres)", min_value=200, max_value=3000, value=800, step=100)
+
+today = datetime.today().date()
+default_start = today - timedelta(days=90)
+start_date = st.sidebar.date_input("Date de début", default_start)
+end_date = st.sidebar.date_input("Date de fin", today)
+
+if start_date > end_date:
+    st.sidebar.error("La date de début doit être <= à la date de fin.")
+
+max_pois = st.sidebar.slider("Nombre maximum de POI à analyser", 3, 30, 10)
+
+run_button = st.sidebar.button("🚀 Lancer / mettre à jour l'analyse")
+
+
+# =========================
+# 4. Lancement / mise à jour
+# =========================
+if run_button and start_date <= end_date:
+    # 1) Géocodage
+    with st.spinner("Géocodage de la zone…"):
+        if mode == "Adresse":
+            lat, lon = geocode_address(address)
+            if lat is None:
+                st.error("Impossible de géocoder cette adresse. Essaie d'être plus précis.")
+                st.stop()
+        # Sinon lat/lon déjà fournis
+
+    st.session_state["zone_center"] = (lat, lon)
+
+    # 2) Récupération des POI
+    with st.spinner("Recherche des POI significatifs via OpenStreetMap…"):
+        df_pois = fetch_pois_from_osm(lat, lon, radius_m=radius_m, max_pois=max_pois)
+
+    if df_pois.empty:
+        st.warning("Aucun point d'intérêt significatif trouvé dans ce rayon. Essaie d'augmenter le rayon ou de changer de zone.")
+        st.session_state["results_ready"] = False
+    else:
+        # 3) Séries journalières pour chaque POI
+        all_series = []
+        progress = st.progress(0)
+        total = len(df_pois)
+
+        for i, (_, poi) in enumerate(df_pois.iterrows(), start=1):
+            df_ts = get_daily_footfall_for_poi(poi, start_date, end_date)
+            df_ts["poi_name"] = poi["name"]
+            df_ts["poi_type"] = poi["type"]
+            all_series.append(df_ts)
+            progress.progress(i / total)
+
+        df_all = pd.concat(all_series, ignore_index=True)
+
+        # Stockage en session_state pour que ça reste quand on change de POI / onglet
+        st.session_state["df_pois"] = df_pois
+        st.session_state["df_all"] = df_all
+        st.session_state["results_ready"] = True
+
+
+# =========================
+# 5. Affichage des résultats
+# =========================
+if st.session_state["results_ready"] and st.session_state["df_pois"] is not None:
+
+    df_pois = st.session_state["df_pois"]
+    df_all = st.session_state["df_all"]
+    lat, lon = st.session_state["zone_center"]
+
+    st.success(f"Zone analysée centrée sur lat={lat:.5f}, lon={lon:.5f}")
+
+    st.subheader("📍 Points d'intérêt identifiés")
+    st.dataframe(df_pois[["name", "type", "lat", "lon"]])
+
+    # Carte des POI de la zone
+    st.markdown("### 🗺️ Carte des POI de la zone")
+    df_map = df_pois.rename(columns={"lat": "latitude", "lon": "longitude"})
+    st.map(df_map, zoom=13)
+
+    st.subheader("📊 Séries journalières")
+
+    tab1, tab2 = st.tabs(["Détail par POI", "Moyenne de la zone"])
+
+    with tab1:
+        st.markdown("### 📌 Détail des flux par POI (simulés)")
+        poi_selected = st.selectbox("Choisir un POI", df_pois["name"].tolist())
+        df_one = df_all[df_all["poi_name"] == poi_selected].copy()
+        df_one = df_one.sort_values("date")
+
+        st.line_chart(
+            df_one.set_index("date")["footfall"],
+            height=300
+        )
+        st.write(df_one[["date", "footfall"]])
+
+    with tab2:
+        st.markdown("### 📊 Moyenne journalière de flux sur l'ensemble de la zone")
+
+        df_zone = (
+            df_all
+            .groupby("date", as_index=False)["footfall"]
+            .mean()
+            .rename(columns={"footfall": "footfall_mean"})
+        )
+
+        st.line_chart(
+            df_zone.set_index("date")["footfall_mean"],
+            height=300
+        )
+        st.write(df_zone)
+
+        csv = df_zone.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "💾 Télécharger la moyenne journalière (CSV)",
+            data=csv,
+            file_name="footfall_zone_daily_mean.csv",
+            mime="text/csv"
+        )
+else:
+    st.info("Clique sur **🚀 Lancer / mettre à jour l'analyse** dans la barre latérale pour démarrer.")
