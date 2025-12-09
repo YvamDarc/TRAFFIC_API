@@ -153,7 +153,8 @@ on récupère les **points d'intérêt significatifs** (OSM) dans le rayon,
 puis on construit une **série quotidienne de flux** par POI et une **moyenne** sur la zone.
 
 ⚠️ Pour l'instant, les flux sont **simulés**.  
-Il suffira de remplacer la fonction `get_daily_footfall_for_poi` par ta vraie API.
+Dans une version connectée à une API réelle (données télécom, comptages capteurs, etc.),
+chaque point représenterait un nombre de passages/jour dans la zone étudiée.
 """
 )
 
@@ -240,7 +241,6 @@ if run_button and start_date <= end_date:
         else:
             default_address = "Rennes, France"
         address = st.sidebar.text_input("Adresse / ville / lieu", default_address, key="addr_input_run")
-        # ⚠️ Si l'utilisateur ne modifie pas l'adresse ici, on prend la valeur par défaut
         addr_to_geocode = address or default_address
 
         with st.spinner("Géocodage de l'adresse…"):
@@ -328,12 +328,90 @@ if st.session_state["results_ready"] and st.session_state["df_pois"] is not None
             .rename(columns={"footfall": "footfall_mean"})
         )
 
+        df_zone = df_zone.sort_values("date")
+
+        # Courbe de moyenne
         st.line_chart(
             df_zone.set_index("date")["footfall_mean"],
             height=300
         )
         st.write(df_zone)
 
+        # 🔹 Préambule sur l'origine et la nature de la donnée
+        st.markdown(
+            """
+            ### ℹ️ Origine et nature de l'indicateur
+
+            - **Origine actuelle** : les valeurs affichées sont **simulées** à des fins de démonstration.
+              Dans une version connectée, elles seraient alimentées par une source réelle
+              (données de mobilité télécom, capteurs physiques, API de trafic, etc.).
+            - **Ce que compte l'indicateur** :
+              - chaque point représente un **niveau de fréquentation quotidien** (indice de flux),
+              - il s'agit d'une **moyenne** sur l'ensemble des points d'intérêt (POI) identifiés dans le rayon,
+              - la granularité est **journalière** : 1 ligne = 1 jour civil.
+            - **Interprétation** :
+              - plus la valeur est élevée, plus la zone est fréquentée ce jour-là,
+              - la tendance de la courbe permet de visualiser la dynamique de la zone : croissance, stabilisation, recul.
+            """
+        )
+
+        # 🔹 Bloc statistique de synthèse
+        st.markdown("### 📌 Statistiques de synthèse sur la période")
+
+        if len(df_zone) >= 2:
+            start_date_series = df_zone["date"].iloc[0]
+            end_date_series = df_zone["date"].iloc[-1]
+            start_val = float(df_zone["footfall_mean"].iloc[0])
+            end_val = float(df_zone["footfall_mean"].iloc[-1])
+            avg_val = float(df_zone["footfall_mean"].mean())
+            total_flux = float(df_zone["footfall_mean"].sum())
+            n_days = int(len(df_zone))
+
+            growth_abs = end_val - start_val
+            if start_val > 0:
+                growth_pct = (end_val / start_val - 1) * 100
+            else:
+                growth_pct = None
+
+            col1, col2, col3 = st.columns(3)
+
+            col1.metric(
+                "Flux moyen quotidien",
+                f"{avg_val:,.0f}",
+                help="Moyenne des valeurs de fréquentation quotidienne sur la période."
+            )
+
+            col2.metric(
+                "Flux total sur la période",
+                f"{total_flux:,.0f}",
+                help="Somme des valeurs quotidiennes de fréquentation (indice cumulé)."
+            )
+
+            if growth_pct is not None:
+                col3.metric(
+                    "Croissance sur la période",
+                    f"{growth_pct:,.1f} %",
+                    delta=f"{growth_abs:,.0f}",
+                    help=(
+                        "Variation entre le premier et le dernier jour de la période, "
+                        "en % et en niveau absolu."
+                    )
+                )
+            else:
+                col3.metric(
+                    "Croissance sur la période",
+                    "n.c.",
+                    help="Non calculable car la valeur de départ est nulle ou manquante."
+                )
+
+            st.caption(
+                f"Période analysée : du {start_date_series.date()} au {end_date_series.date()} "
+                f"({n_days} jours)."
+            )
+        else:
+            st.info("La période sélectionnée est trop courte pour calculer une croissance (au moins 2 jours nécessaires).")
+
+        # Export CSV
         csv = df_zone.to_csv(index=False).encode("utf-8")
         st.download_button(
             "💾 Télécharger la moyenne journalière (CSV)",
