@@ -273,15 +273,32 @@ else:
             placeholder="ex : A84, N12, 22, Ille-et-Vilaine...",
         )
 
-        year_range = st.slider(
-            "Plage d'années à considérer pour l'historique",
-            min_value=year_min,
-            max_value=year_max,
-            value=(max(year_min, year_max - 10), year_max),
-            step=1,
-        )
+        # 🛠 Cas particulier : une seule année dispo → pas de slider "plage"
+        if year_min == year_max:
+            st.info(f"Une seule année de mesure est disponible : {year_min}.")
+            year_range = (year_min, year_max)
+        else:
+            year_range = st.slider(
+                "Plage d'années à considérer pour l'historique",
+                min_value=year_min,
+                max_value=year_max,
+                value=(max(year_min, year_max - 10), year_max),
+                step=1,
+            )
 
         df_filtered, df_hist = build_tmja_history(df_tmja, filter_text)
+
+        # Filtre des années sur les data
+        df_filtered = df_filtered[
+            (df_filtered["anneeMesureTrafic"] >= year_range[0])
+            & (df_filtered["anneeMesureTrafic"] <= year_range[1])
+        ]
+        if not df_hist.empty:
+            df_hist = df_hist[
+                (df_hist["anneeMesureTrafic"] >= year_range[0])
+                & (df_hist["anneeMesureTrafic"] <= year_range[1])
+            ]
+
 
         df_filtered = df_filtered[
             (df_filtered["anneeMesureTrafic"] >= year_range[0])
