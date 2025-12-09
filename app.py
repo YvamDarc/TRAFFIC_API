@@ -1,11 +1,15 @@
-import streamlit as st
-import requests
-import pandas as pd
-import numpy as np
+import math
 from datetime import datetime, timedelta
+
+import numpy as np
+import pandas as pd
+import requests
+import streamlit as st
 
 import folium
 from streamlit_folium import st_folium
+from populartimes import get as pt_get
+
 
 # =========================
 # 0. Session state
@@ -44,96 +48,142 @@ def geocode_address(address: str):
     return float(data[0]["lat"]), float(data[0]["lon"])
 
 
-def fetch_pois_from_osm(lat: float, lon: float, radius_m: int = 500, max_pois: int = 10):
+def bbox_from_center(lat: float, lon: float, radius_m: int):
     """
-    Récupère des points d'intérêt significatifs autour d'un point via Overpass.
+    Calcule un rectangle englobant (bbox) autour d'un centre (lat, lon)
+    à partir d'un rayon en mètres.
+
+    Retourne (southwest_lat, southwest_lon), (northeast_lat, northeast_lon)
     """
-    overpass_url = "https://overpass-api.de/api/interpreter"
+    # 1° de latitude ≈ 111 km
+    delta_lat = radius_m / 111_000.0
 
-    query = f"""
-    [out:json][timeout:25];
-    (
-      node
-        ["shop"~"supermarket|mall|department_store|convenience"]
-        (around:{radius_m},{lat},{lon});
-      node
-        ["amenity"~"cinema|theatre|fast_food|restaurant|pub|bar|cafe|bank"]
-        (around:{radius_m},{lat},{lon});
-      node
-        ["amenity"~"bus_station|ferry_terminal|marketplace"]
-        (around:{radius_m},{lat},{lon});
-      node
-        ["railway"="station"]
-        (around:{radius_m},{lat},{lon});
-    );
-    out body;
-    >;
-    out skel qt;
+    # 1° de longitude ≈ 111 km * cos(latitude)
+    delta_lon = radius_m / (111_000.0 * math.cos(math.radians(lat)))
+
+    sw = (lat - delta_lat, lon - delta_lon)
+    ne = (lat + delta_lat, lon + delta_lon)
+    return sw, ne
+
+
+# =========================================
+# 2. Fournisseur de données : Popular Times
+# =========================================
+
+GOOGLE_POI_TYPES = [
+    "store",
+    "shopping_mall",
+    "supermarket",
+    "grocery_or_supermarket",
+    "department_store",
+    "clothing_store",
+    "bakery",
+    "restaurant",
+    "cafe",
+    "bar",
+    "movie_theater"
+]
+
+
+def fetch_places_populartimes(api_key: str, lat: float, lon: float, radius_m: int, max_pois: int):
     """
+    Appelle Google Popular Times via la librairie `populartimes.get`
+    en utilisant une bbox calculée autour du centre.
 
-    resp = requests.post(overpass_url, data=query, headers={"User-Agent": "streamlit-footfall-app"})
-    resp.raise_for_status()
-    data = resp.json()
+    Retourne :
+    - places : liste brute renvoyée par populartimes
+    - df_pois : DataFrame des points d'intérêt (un par établissement)
+    """
+    sw, ne = bbox_from_center(lat, lon, radius_m)
 
-    elements = data.get("elements", [])
+    # La lib travaille sur une bbox (southwest, northeast)
+    # southwest = (lat_min, lon_min), northeast = (lat_max, lon_max)
+    sw_lat, sw_lon = sw
+    ne_lat, ne_lon = ne
+
+    # Appel à PopularTimes
+    places = pt_get(
+        api_key,
+        GOOGLE_POI_TYPES,
+        (sw_lat, sw_lon),
+        (ne_lat, ne_lon)
+    )
+
+    if not places:
+        return [], pd.DataFrame()
+
     pois = []
-    for el in elements:
-        if el.get("type") != "node":
-            continue
-        tags = el.get("tags", {})
-        name = tags.get("name")
-        if not name:
-            continue
-        poi_type = tags.get("shop") or tags.get("amenity") or tags.get("railway") or "poi"
+    for p in places:
+        coord = p.get("coordinates", {})
         pois.append({
-            "id": el["id"],
-            "name": name,
-            "type": poi_type,
-            "lat": el["lat"],
-            "lon": el["lon"],
+            "place_id": p.get("id"),
+            "name": p.get("name"),
+            "types": ", ".join(p.get("types", [])),
+            "lat": coord.get("lat"),
+            "lon": coord.get("lng"),
         })
 
-    df_pois = pd.DataFrame(pois)
-    if df_pois.empty:
-        return df_pois
+    df_pois = pd.DataFrame(pois).dropna(subset=["lat", "lon"])
 
-    priority_keywords = ["mall", "station", "supermarket", "marketplace", "cinema"]
-    df_pois["priority"] = df_pois["type"].apply(
-        lambda t: 0 if any(pk in t for pk in priority_keywords) else 1
-    )
-    df_pois = df_pois.sort_values(["priority", "name"]).head(max_pois).reset_index(drop=True)
-    return df_pois
+    # On limite le nombre de POI
+    if not df_pois.empty and len(df_pois) > max_pois:
+        df_pois = df_pois.head(max_pois)
+
+    # On filtre aussi la liste brute `places` pour ne garder que ceux des df_pois
+    place_ids_kept = set(df_pois["place_id"].tolist())
+    places_filtered = [p for p in places if p.get("id") in place_ids_kept]
+
+    return places_filtered, df_pois
 
 
-# =========================================
-# 2. Fournisseur de données de flux (simulé)
-# =========================================
+def build_daily_series_from_populartimes(place_data: dict, start_date, end_date):
+    """
+    Transforme le profil hebdomadaire PopularTimes en série journalière
+    sur la période [start_date, end_date].
 
-def simulate_daily_footfall_for_poi(poi_id, start_date, end_date):
-    """Génère une série quotidienne de flux simulés pour un POI."""
+    PopularTimes renvoie, pour chaque jour de la semaine, 24 valeurs (0–100)
+    => on agrège par jour : somme des 24 heures = indice de flux quotidien.
+    """
     rng = pd.date_range(start_date, end_date, freq="D")
-    np.random.seed(int(poi_id) % 2**32)
-    base = np.random.randint(300, 1500)
-    weekday_effect = np.array([1.1, 1.05, 1.0, 1.0, 1.15, 1.4, 0.7])  # lun→dim
-    noise = np.random.normal(0, base * 0.1, size=len(rng))
 
+    pop_week = place_data.get("populartimes", [])
+    if not pop_week or len(pop_week) != 7:
+        # Si données absentes, on renvoie une série à 0
+        return pd.DataFrame({
+            "date": rng,
+            "footfall": np.zeros(len(rng), dtype=float)
+        })
+
+    # pop_week est une liste de 7 dicts : [{"name": "Monday", "data": [...]}, ...]
+    # On les range dans l'ordre Monday (0) → Sunday (6)
+    # En principe l'ordre est déjà bon, mais on sécurise
+    day_name_to_index = {
+        "Monday": 0,
+        "Tuesday": 1,
+        "Wednesday": 2,
+        "Thursday": 3,
+        "Friday": 4,
+        "Saturday": 5,
+        "Sunday": 6,
+    }
+
+    daily_pattern = [0.0] * 7
+    for d in pop_week:
+        name = d.get("name")
+        data = d.get("data", [])
+        if name in day_name_to_index and len(data) == 24:
+            idx = day_name_to_index[name]
+            # indice de flux quotidien = somme des 24 heures
+            daily_pattern[idx] = float(sum(data))
+
+    # Construction de la série
     values = []
-    for i, d in enumerate(rng):
-        factor = weekday_effect[d.weekday()]
-        val = max(0, base * factor + noise[i])
-        values.append(val)
+    for d in rng:
+        idx = d.weekday()  # Monday=0
+        values.append(daily_pattern[idx])
 
     df = pd.DataFrame({"date": rng, "footfall": values})
-    df["poi_id"] = poi_id
     return df
-
-
-def get_daily_footfall_for_poi(poi_row, start_date, end_date):
-    """
-    ➜ À remplacer plus tard par ton appel API réel.
-    Doit renvoyer un DataFrame : date, footfall, poi_id.
-    """
-    return simulate_daily_footfall_for_poi(poi_row["id"], start_date, end_date)
 
 
 # =========================
@@ -141,21 +191,33 @@ def get_daily_footfall_for_poi(poi_row, start_date, end_date):
 # =========================
 
 st.set_page_config(
-    page_title="Analyse de flux - Multi-zones",
+    page_title="Analyse de flux - Popular Times",
     layout="wide"
 )
 
-st.title("📈 Analyse générale de flux de personnes par zone géographique")
+st.title("📈 Analyse de flux de personnes par zone – données Google Popular Times")
+
 st.write(
     """
-Appli **généraliste** : tu définis une zone (via carte, adresse ou coordonnées),  
-on récupère les **points d'intérêt significatifs** (OSM) dans le rayon,  
-puis on construit une **série quotidienne de flux** par POI et une **moyenne** sur la zone.
+Cette application estime la **fréquentation quotidienne** d'une zone en s'appuyant sur :
 
-⚠️ Pour l'instant, les flux sont **simulés**.  
-Dans une version connectée à une API réelle (données télécom, comptages capteurs, etc.),
-chaque point représenterait un nombre de passages/jour dans la zone étudiée.
+- les établissements présents autour d'un point (données Google Maps),
+- leurs profils d'**affluence moyenne horaire** (*Popular Times*),
+- une agrégation en **indice de flux quotidien** sur la période choisie.
+
+🔍 **Important** : Popular Times ne fournit pas un historique jour par jour,
+mais un **profil moyen par jour de semaine**.  
+La série produite ici est donc un **profil moyen journalier répété sur la période**,
+et non la réalité exacte de chaque date.
 """
+)
+
+# ---- Clé API Google ----
+st.sidebar.header("🔑 Connexion Google")
+google_api_key = st.sidebar.text_input(
+    "Clé API Google Maps / Places (obligatoire)",
+    type="password",
+    help="Clé liée à un projet Google Cloud avec accès à l'API Places."
 )
 
 # ---- Paramètres de la zone ----
@@ -227,6 +289,10 @@ if mode == "Carte (clic)":
 # =========================
 
 if run_button and start_date <= end_date:
+    if not google_api_key:
+        st.error("Merci de renseigner une clé API Google valide dans la barre latérale.")
+        st.stop()
+
     # Détermination du centre de zone
     if mode == "Carte (clic)":
         if st.session_state["picked_lat"] is None or st.session_state["picked_lon"] is None:
@@ -255,32 +321,56 @@ if run_button and start_date <= end_date:
 
     st.session_state["zone_center"] = (lat, lon)
 
-    # 2) Récupération des POI
-    with st.spinner("Recherche des POI significatifs via OpenStreetMap…"):
-        df_pois = fetch_pois_from_osm(lat, lon, radius_m=radius_m, max_pois=max_pois)
+    # 1) Récupération des lieux + Popular Times
+    with st.spinner("Récupération des établissements et de leurs profils Popular Times…"):
+        try:
+            places, df_pois = fetch_places_populartimes(
+                google_api_key,
+                lat,
+                lon,
+                radius_m=radius_m,
+                max_pois=max_pois
+            )
+        except Exception as e:
+            st.error(f"Erreur lors de l'appel Popular Times : {e}")
+            st.session_state["results_ready"] = False
+            st.stop()
 
     if df_pois.empty:
-        st.warning("Aucun point d'intérêt significatif trouvé dans ce rayon. Essaie d'augmenter le rayon ou de changer de zone.")
+        st.warning("Aucun établissement avec données Popular Times trouvé dans ce rayon.")
         st.session_state["results_ready"] = False
     else:
-        # 3) Séries journalières pour chaque POI
+        # 2) Construction des séries journalières pour chaque établissement
         all_series = []
         progress = st.progress(0)
-        total = len(df_pois)
+        total = len(places)
+
+        places_by_id = {p.get("id"): p for p in places}
 
         for i, (_, poi) in enumerate(df_pois.iterrows(), start=1):
-            df_ts = get_daily_footfall_for_poi(poi, start_date, end_date)
+            place_id = poi["place_id"]
+            pdata = places_by_id.get(place_id)
+            if not pdata:
+                continue
+
+            df_ts = build_daily_series_from_populartimes(pdata, start_date, end_date)
             df_ts["poi_name"] = poi["name"]
-            df_ts["poi_type"] = poi["type"]
+            df_ts["poi_type"] = poi["types"]
+            df_ts["place_id"] = place_id
             all_series.append(df_ts)
+
             progress.progress(i / total)
 
-        df_all = pd.concat(all_series, ignore_index=True)
+        if not all_series:
+            st.warning("Impossible de construire des séries à partir des données Popular Times disponibles.")
+            st.session_state["results_ready"] = False
+        else:
+            df_all = pd.concat(all_series, ignore_index=True)
 
-        # Stockage en session_state
-        st.session_state["df_pois"] = df_pois
-        st.session_state["df_all"] = df_all
-        st.session_state["results_ready"] = True
+            # Stockage en session_state
+            st.session_state["df_pois"] = df_pois
+            st.session_state["df_all"] = df_all
+            st.session_state["results_ready"] = True
 
 
 # =========================
@@ -294,21 +384,21 @@ if st.session_state["results_ready"] and st.session_state["df_pois"] is not None
 
     st.success(f"Zone analysée centrée sur lat = {lat:.5f}, lon = {lon:.5f}")
 
-    st.subheader("📍 Points d'intérêt identifiés")
-    st.dataframe(df_pois[["name", "type", "lat", "lon"]])
+    st.subheader("📍 Établissements pris en compte (Google Places)")
+    st.dataframe(df_pois[["name", "types", "lat", "lon"]])
 
     # Carte des POI
-    st.markdown("### 🗺️ Carte des POI de la zone")
+    st.markdown("### 🗺️ Carte des établissements de la zone")
     df_map = df_pois.rename(columns={"lat": "latitude", "lon": "longitude"})
     st.map(df_map, zoom=13)
 
-    st.subheader("📊 Séries journalières")
+    st.subheader("📊 Séries journalières (indice de flux)")
 
-    tab1, tab2 = st.tabs(["Détail par POI", "Moyenne de la zone"])
+    tab1, tab2 = st.tabs(["Détail par établissement", "Moyenne de la zone"])
 
     with tab1:
-        st.markdown("### 📌 Détail des flux par POI (simulés)")
-        poi_selected = st.selectbox("Choisir un POI", df_pois["name"].tolist())
+        st.markdown("### 📌 Détail par établissement (indice basé sur Popular Times)")
+        poi_selected = st.selectbox("Choisir un établissement", df_pois["name"].tolist())
         df_one = df_all[df_all["poi_name"] == poi_selected].copy()
         df_one = df_one.sort_values("date")
 
@@ -319,7 +409,7 @@ if st.session_state["results_ready"] and st.session_state["df_pois"] is not None
         st.write(df_one[["date", "footfall"]])
 
     with tab2:
-        st.markdown("### 📊 Moyenne journalière de flux sur l'ensemble de la zone")
+        st.markdown("### 📊 Moyenne journalière de l'indice de flux sur l'ensemble de la zone")
 
         df_zone = (
             df_all
@@ -342,16 +432,18 @@ if st.session_state["results_ready"] and st.session_state["df_pois"] is not None
             """
             ### ℹ️ Origine et nature de l'indicateur
 
-            - **Origine actuelle** : les valeurs affichées sont **simulées** à des fins de démonstration.
-              Dans une version connectée, elles seraient alimentées par une source réelle
-              (données de mobilité télécom, capteurs physiques, API de trafic, etc.).
+            - **Origine** : données issues de Google Maps / Popular Times, via un appel API sur les
+              établissements présents dans le périmètre étudié.
             - **Ce que compte l'indicateur** :
-              - chaque point représente un **niveau de fréquentation quotidien** (indice de flux),
-              - il s'agit d'une **moyenne** sur l'ensemble des points d'intérêt (POI) identifiés dans le rayon,
-              - la granularité est **journalière** : 1 ligne = 1 jour civil.
-            - **Interprétation** :
-              - plus la valeur est élevée, plus la zone est fréquentée ce jour-là,
-              - la tendance de la courbe permet de visualiser la dynamique de la zone : croissance, stabilisation, recul.
+              - pour chaque établissement, Popular Times fournit un **profil horaire moyen** (0–100)
+                par jour de la semaine ;
+              - ces profils sont **agrégés par jour** (somme des 24 heures) pour produire un
+                **indice quotidien de fréquentation** ;
+              - pour la zone, on fait ensuite une **moyenne** de ces indices sur
+                l'ensemble des établissements retenus.
+            - **Granularité** :
+              - 1 point = 1 jour civil,
+              - la série est un **profil moyen répété** sur la période, pas un historique réel date par date.
             """
         )
 
@@ -376,25 +468,25 @@ if st.session_state["results_ready"] and st.session_state["df_pois"] is not None
             col1, col2, col3 = st.columns(3)
 
             col1.metric(
-                "Flux moyen quotidien",
+                "Indice moyen quotidien de flux",
                 f"{avg_val:,.0f}",
-                help="Moyenne des valeurs de fréquentation quotidienne sur la période."
+                help="Moyenne de l'indice quotidien de fréquentation (Popular Times agrégé) sur la période."
             )
 
             col2.metric(
-                "Flux total sur la période",
+                "Indice cumulé de flux sur la période",
                 f"{total_flux:,.0f}",
-                help="Somme des valeurs quotidiennes de fréquentation (indice cumulé)."
+                help="Somme des indices quotidiens de fréquentation (profil moyen répété)."
             )
 
             if growth_pct is not None:
                 col3.metric(
-                    "Croissance sur la période",
+                    "Croissance apparente sur la période",
                     f"{growth_pct:,.1f} %",
                     delta=f"{growth_abs:,.0f}",
                     help=(
                         "Variation entre le premier et le dernier jour de la période, "
-                        "en % et en niveau absolu."
+                        "en % et en niveau absolu, sur la base du profil moyen."
                     )
                 )
             else:
@@ -414,10 +506,10 @@ if st.session_state["results_ready"] and st.session_state["df_pois"] is not None
         # Export CSV
         csv = df_zone.to_csv(index=False).encode("utf-8")
         st.download_button(
-            "💾 Télécharger la moyenne journalière (CSV)",
+            "💾 Télécharger la série moyenne journalière (CSV)",
             data=csv,
-            file_name="footfall_zone_daily_mean.csv",
+            file_name="footfall_zone_daily_mean_populartimes.csv",
             mime="text/csv"
         )
 else:
-    st.info("Configure la zone dans la barre latérale puis clique sur **🚀 Lancer / mettre à jour l'analyse**.")
+    st.info("Configure la zone + la clé API dans la barre latérale puis clique sur **🚀 Lancer / mettre à jour l'analyse**.")
